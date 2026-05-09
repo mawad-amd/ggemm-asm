@@ -17,9 +17,7 @@ Two optimization tracks:
 
 ## Performance
 
-![Latency comparison](perf.png)
-
-![Throughput comparison](tflops.png)
+![Performance comparison](perf.png)
 
 MI355X (gfx950), ROCm 7.2.0. C launcher (co_compare.cpp), warmup=50, iters=200. FP8 (e4m3fnuz x e5m2fnuz) -> BF16.
 
