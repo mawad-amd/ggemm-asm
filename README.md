@@ -1,97 +1,81 @@
 # FP8 Grouped GEMM Wgrad — ASM Optimization for MI355X
 
-Hand-tuned AMDGCN assembly optimization of Triton's FP8 grouped GEMM weight-gradient kernel on MI355X (gfx950). Uses `v_mfma_f32_16x16x32_fp8_bf8` (16x16x32 MFMA).
+Hand-tuned AMDGCN assembly optimization of Triton's FP8 grouped GEMM weight-gradient kernel on MI355X (gfx950).
+
+Two optimization tracks:
+1. **Legacy MFMA** (`v_mfma_f32_16x16x32_fp8_bf8`): instruction scheduling on Triton's compiled output — **1.10-1.13x**
+2. **dot_scaled MFMA** (`v_mfma_f32_32x32x64_f8f6f4`): MI355X-native opcode with 8x FLOPs/instruction, plus ASM scheduling — **1.52-1.64x**
 
 ## Kernels
 
-| Kernel | File | Description |
-|--------|------|-------------|
-| **Reference** | `kernels/variable_k_gemm_ref.co` | Triton-compiled baseline (Primus v26.2) |
-| **Optimized** | `kernels/variable_k_wgrad_mega.s` | Hand-tuned assembly, all optimizations combined |
+| Kernel | File | MFMA | Description |
+|--------|------|------|-------------|
+| **Legacy ref** | `kernels/variable_k_gemm_ref.co` | 16x16x32 fp8_bf8 | Triton-compiled baseline |
+| **Legacy ASM** | `kernels/variable_k_wgrad_mega.s` | 16x16x32 fp8_bf8 | Hand-tuned, buffer_load hoisting + MOV removal |
+| **dot_scaled ref** | `kernels/dot_scaled_ref.s` | 32x32x64 f8f6f4 | Triton `tl.dot_scaled` compiled baseline |
+| **dot_scaled ASM** | `kernels/dot_scaled_v2.s` | 32x32x64 f8f6f4 | Hand-tuned, buffer_load hoisting + waitcnt optimization |
 
 ## Performance
 
-![Latency comparison](perf.png)
+MI355X (gfx950), ROCm 7.2.0, `rocm/primus:v26.2`. Rainier cluster mi355x-thor-2.
+Python harness (bench.py), warmup=50, iters=200. FP8 (e4m3fnuz x e5m2fnuz) -> BF16.
 
-![Throughput comparison](tflops.png)
+### gate_up_wgrad (E=32, M=131072, OUT_M=2880, OUT_N=5760, 4.35 TFLOP)
 
-Python harness (bench.py), warmup=50, iters=200. FP8 (e4m3 x e5m2) -> BF16. MI355X (gfx950), ROCm 7.2.0, `rocm/primus:v26.2`.
+| Kernel | Time (ms) | TFLOPS | vs Legacy ref |
+|--------|-----------|--------|---------------|
+| Legacy ref (Triton) | 3.896 | 1116 | 1.00x |
+| Legacy ASM (mega) | 3.526 | 1233 | 1.10x |
+| dot_scaled Triton JIT | 2.578 | 1687 | 1.51x |
+| **dot_scaled ASM v2** | **2.558** | **1700** | **1.52x** |
 
-### gate_up_wgrad (E=32, M=131072, OUT_M=2880, OUT_N=5760)
+### down_wgrad (E=32, M=131072, OUT_M=2880, OUT_N=2880, 2.17 TFLOP)
 
-| Kernel | Time (ms) | TFLOPS | vs Reference |
-|--------|-----------|--------|--------------|
-| Reference (Triton) | 3.874 | 1123 | 1.00x |
-| Optimized (ASM) | 3.526 | 1233 | **1.10x** |
-| dot_scaled (32x32x64 MFMA) | 2.591 | 1678 | 1.50x |
+| Kernel | Time (ms) | TFLOPS | vs Legacy ref |
+|--------|-----------|--------|---------------|
+| Legacy ref (Triton) | 2.201 | 988 | 1.00x |
+| Legacy ASM (mega) | 1.953 | 1113 | 1.13x |
+| dot_scaled Triton JIT | 1.341 | 1621 | 1.64x |
+| **dot_scaled ASM v2** | **1.338** | **1625** | **1.64x** |
 
-### down_wgrad (E=32, M=131072, OUT_M=2880, OUT_N=2880)
+Correctness: cos=1.000, max_diff=0.031250 vs torch on both sites. dot_scaled ASM vs dot_scaled Triton: cos=1.000, max_diff=0.000 (bit-identical).
 
-| Kernel | Time (ms) | TFLOPS | vs Reference |
-|--------|-----------|--------|--------------|
-| Reference (Triton) | 2.199 | 989 | 1.00x |
-| Optimized (ASM) | 1.953 | 1113 | **1.13x** |
-| dot_scaled (32x32x64 MFMA) | 1.373 | 1584 | 1.60x |
+## Optimization Details
 
-Correctness: cos=1.000, max_diff=0.031250 on both sites, both kernels vs torch reference.
+### Legacy MFMA (variable_k_wgrad_mega.s)
 
-## Optimizations Applied
+Five techniques discovered across 8 parallel agent sessions:
 
-Five optimization techniques, discovered across 8 parallel agent sessions:
+1. **RHS buffer_load hoisting (+10%)** — moved `buffer_load_dwordx4` from loop bottom to loop top into dead VGPRs v[216:223], extending HBM latency cover from ~120 to ~3500 cycles
+2. **Redundant MOV elimination (+0.3%)** — removed 6 `v_add_u32_e32 vX, 0, vY` identity copies, freed registers for buffer_load hoisting
+3. **ds_read overlap via v[138:139] (+1.6%)** — used dead scale-factor registers as rotating ds_read temps, eliminated ~40-cycle stalls per pair
+4. **Loop tail restructure (+0.5%)** — moved 6 loop-control instructions to final MFMA co-execution window
+5. **s_waitcnt vmcnt(0) before s_endpgm** — gfx950 stores can leak without explicit drain
 
-### 1. RHS buffer_load hoisting (+10%)
-Moved RHS `buffer_load_dwordx4` from loop bottom to loop top. Dead VGPRs `v[216:223]` hold prefetched RHS data, extending HBM latency cover from ~120 to ~3500 cycles.
+### dot_scaled MFMA (dot_scaled_v2.s)
 
-### 2. Redundant MOV elimination (+0.3%)
-Removed 6 `v_add_u32_e32 vX, 0, vY` instructions copying loop-invariant LDS base addresses. Freed registers for buffer_load hoisting.
+The big win is the opcode upgrade: `v_mfma_f32_32x32x64_f8f6f4` does 131,072 FLOPs per instruction (8x the legacy 16,384). Triton's `tl.dot_scaled` compiler generates this automatically. On top of the Triton JIT output:
 
-### 3. ds_read overlap via v[138:139] (+1.6%)
-`v[138:139]` hold the FP8 scale factor but are not read during the inner loop — only consumed in the epilog for output scaling. Used them as a second rotating `ds_read` temp: issue both reads, `lgkmcnt(1)` to drain the first, consume during MFMA, `lgkmcnt(0)` for the second. Eliminates ~40-cycle stalls per pair. Scale factor is restored from v136 at loop exit.
+1. **RHS buffer_load hoisting (+0.8%)** — moved first RHS prefetch `buffer_load_dwordx4 v[122:125]` from after MFMA #6 to after loop control (line 659), giving ~30 additional instructions of HBM latency cover. FIFO vmcnt drain order preserved.
+2. **Redundant s_waitcnt lgkmcnt(0) removal** — removed a duplicate lgkmcnt(0) before s_barrier that was redundant since the previous lgkmcnt(0) had already drained all LDS reads with no new LDS ops issued between them.
 
-### 4. Loop tail restructure (+0.5%)
-Moved 6 loop-control instructions (`s_add`, `v_add` x3, `s_cmp`, `v_add`) from the loop top to the tail, hidden in the final MFMA co-execution window.
+The dot_scaled kernel is much harder to optimize than legacy — Triton's scheduler already places every waitcnt at the minimum value, and occupancy=2 (128 VGPRs) provides good stall hiding. Remaining headroom requires algorithmic changes (triple buffering, different tile sizes).
 
-### 5. s_waitcnt vmcnt(0) before s_endpgm
-gfx950 has no hardware interlock before `s_endpgm`. Global stores can leak without an explicit drain.
+### What was tried and rejected
 
-### Compounding
-
-| Step | Marginal | Cumulative |
-|------|----------|------------|
-| MOV elimination + loop tail | +1.2% | 1.012x |
-| + buffer_load hoisting | +10.3% | 1.116x |
-| + ds_read overlap | +1.4% | 1.132x |
-
-Remaining ~7% gap to peak is structural: inter-CTA barrier overhead and variable-K CTA imbalance across 32 experts.
+- **s_setprio 3/0** around MFMA blocks — no benefit at occupancy=2, slight regression from extra instructions
+- **MFMA reordering** (moving MFMA #8 before s_barrier) — consistent ~2% regression on gate_up_wgrad, barrier blocks MFMA execution
+- **Loop tail restructuring** on dot_scaled — reduced performance when combined with buffer_load hoisting
 
 ## Reproduce
 
 ### Requirements
 
 - MI355X GPU (gfx950)
-- ROCm 6.x+ with `llvm-mc` (for assembly)
+- ROCm 6.x+ with `llvm-mc`, `ld.lld`, `llvm-objcopy`, `llvm-readelf`
+- Docker image `rocm/primus:v26.2` (or equivalent with Triton + PyTorch)
 
-### C launcher (recommended, zero Python overhead)
-
-```bash
-# Build
-hipcc -O3 -o co_compare co_compare.cpp
-
-# Benchmark ref kernel on both wgrad sites
-export HIP_VISIBLE_DEVICES=0
-./co_compare kernels/variable_k_gemm_ref.co kernels/variable_k_gemm_ref.co \
-  --benchmark --warmup 50 --iters 200 --site down_wgrad
-./co_compare kernels/variable_k_gemm_ref.co kernels/variable_k_gemm_ref.co \
-  --benchmark --warmup 50 --iters 200 --site gate_up_wgrad
-
-# Assemble optimized, patch into ref, and compare
-python3 tools/patch_co.py kernels/variable_k_gemm_ref.co kernels/variable_k_wgrad_mega.s \
-  kernels/variable_k_wgrad_mega.co --llvm-mc /opt/rocm/llvm/bin/llvm-mc
-./co_compare kernels/variable_k_gemm_ref.co kernels/variable_k_wgrad_mega.co \
-  --benchmark --warmup 50 --iters 200 --site gate_up_wgrad
-```
-
-### Python harness (requires primus_turbo)
+### Benchmark dot_scaled ASM (recommended)
 
 ```bash
 docker run --rm --network=host --device=/dev/kfd --device=/dev/dri \
@@ -100,33 +84,72 @@ docker run --rm --network=host --device=/dev/kfd --device=/dev/dri \
   -v $(pwd):/workspace/ggemm \
   --entrypoint /bin/bash rocm/primus:v26.2 -c "
 cd /workspace/ggemm
-python3 bench.py --ref-co kernels/variable_k_gemm_ref.co --benchmark --site gate_up_wgrad
+# Assembles .s, patches .text into ref .co, benchmarks
+python3 bench.py --kernel kernels/dot_scaled_v2.s
 "
+```
+
+### Benchmark legacy ASM
+
+```bash
+docker run --rm --network=host --device=/dev/kfd --device=/dev/dri \
+  --group-add video --ipc=host --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -v $(pwd):/workspace/ggemm \
+  --entrypoint /bin/bash rocm/primus:v26.2 -c "
+cd /workspace/ggemm
+python3 bench.py --kernel kernels/variable_k_wgrad_mega.s \
+  --ref-co kernels/variable_k_gemm_ref.co
+"
+```
+
+### Correctness only
+
+```bash
+# dot_scaled ASM vs torch + Triton
+python3 bench.py --kernel kernels/dot_scaled_v2.s --correctness
+
+# Legacy ASM vs torch + Triton
+python3 bench.py --kernel kernels/variable_k_wgrad_mega.s \
+  --ref-co kernels/variable_k_gemm_ref.co --correctness
 ```
 
 ## Wgrad Shapes
 
 | Site | OUT_M | OUT_N | Dtypes |
 |------|-------|-------|--------|
-| gate_up_wgrad | 2880 | 5760 | e4m3 x e5m2 -> bf16 |
-| down_wgrad | 2880 | 2880 | e4m3 x e5m2 -> bf16 |
+| gate_up_wgrad | 2880 | 5760 | e4m3fnuz x e5m2fnuz -> bf16 |
+| down_wgrad | 2880 | 2880 | e4m3fnuz x e5m2fnuz -> bf16 |
 
-E=32 experts, M_total=131072 tokens (MoE training batch).
+E=32 experts, M_total=131072 tokens (GPT-OSS 20B MoE training batch).
 
 ## Files
 
 ```
 kernels/
-  variable_k_gemm_ref.co       # Triton-compiled reference kernel
-  variable_k_wgrad_mega.s      # Optimized assembly (+16% over ref)
-  dot_scaled_compiled.co       # dot_scaled kernel (uses 32x32x64 MFMA, 1.76x faster)
-co_compare.cpp                 # C/HIP launcher (supports fwd/dgrad/wgrad sites)
-bench.py                       # Python correctness + benchmark harness
+  variable_k_gemm_ref.co       # Legacy Triton-compiled reference (16x16x32 MFMA)
+  variable_k_gemm_ref.s        # Legacy reference disassembly
+  variable_k_wgrad_mega.s      # Legacy optimized assembly (1.10-1.13x)
+  variable_k_wgrad_opt.s       # Legacy optimized (earlier version)
+  dot_scaled_compiled.co       # dot_scaled Triton-compiled reference (32x32x64 MFMA)
+  dot_scaled_ref.s             # dot_scaled reference disassembly (bit-identical round-trip)
+  dot_scaled_v2.s              # dot_scaled optimized assembly (1.52-1.64x over legacy ref)
+bench.py                       # Python correctness + benchmark harness (assembles .s -> .co)
+co_compare.cpp                 # C/HIP launcher (zero Python overhead)
 launcher.cpp                   # Original standalone C benchmark
 grouped_vark_dot_scaled.py     # Triton kernel source (tl.dot_scaled API)
 tools/
   disasm_to_asm.py             # Convert llvm-objdump output to assembleable .s
   patch_co.py                  # Splice new .text into reference .co
+```
+
+## Assembly Pipeline
+
+```
+llvm-objdump .co -> disasm_to_asm.py -> .s (editable)
+.s -> llvm-mc -> .o -> ld.lld -> tmp.co
+llvm-objcopy --only-section=.text tmp.co -> .text.bin
+Patch .text.bin into reference .co at .text offset (preserves kernel descriptor metadata)
 ```
 
 ## Arg Layout
@@ -140,4 +163,4 @@ stride_out0 (i32), stride_out1 (i32), stride_out2 (i32),
 global_scratch (ptr, nullptr), profile_scratch (ptr, nullptr)
 ```
 
-Grid: `(num_cus, 1, 1)`, Block: `(512, 1, 1)`, Shared: `65536`.
+Grid: `(num_cus, 1, 1)`, Block: `(512, 1, 1)` (legacy) / `(1024, 1, 1)` (dot_scaled), Shared: `65536`.

@@ -97,7 +97,7 @@ SITES = {
 }
 
 # Best config from sweep
-BEST_CONFIG = {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "num_warps": 16, "GROUP_M": 4}
+BEST_CONFIG = {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "num_warps": 16, "GROUP_M": 4, "num_stages": 2}
 
 
 def make_group_lens(E, M_total, seed=42):
@@ -142,7 +142,7 @@ def run_dot_scaled(lhs, rhs, lhs_scale, rhs_scale, group_offs, OUT_M, OUT_N, G, 
         NUM_SMS=NUM_SMS,
         BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"],
         BLOCK_K=cfg["BLOCK_K"], GROUP_M=cfg["GROUP_M"],
-        num_warps=cfg["num_warps"],
+        num_warps=cfg["num_warps"], num_stages=cfg.get("num_stages", 2),
     )
     return out
 
@@ -195,10 +195,92 @@ def bench_ref_co(ref_func, lhs, rhs, ref_out, lhs_scale, rhs_scale, group_offs,
     return se.elapsed_time(ee) / iters
 
 
+def assemble_kernel(s_path, ref_co_path):
+    import subprocess, struct
+    co_path = s_path.replace('.s', '.co')
+    o_path = s_path.replace('.s', '.o')
+    tmp_co = s_path.replace('.s', '_tmp.co')
+    r = subprocess.run(['/opt/rocm/llvm/bin/llvm-mc', '-triple=amdgcn-amd-amdhsa', '-mcpu=gfx950',
+                        '-filetype=obj', '-o', o_path, s_path], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"Assembly failed: {r.stderr}")
+    r = subprocess.run(['/opt/rocm/llvm/bin/ld.lld', '-shared', '-o', tmp_co, o_path],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"Link failed: {r.stderr}")
+    text_bin = s_path.replace('.s', '_text.bin')
+    r = subprocess.run(['/opt/rocm/llvm/bin/llvm-objcopy', '-O', 'binary',
+                        '--only-section=.text', tmp_co, text_bin],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"objcopy failed: {r.stderr}")
+    with open(ref_co_path, 'rb') as f:
+        ref_data = bytearray(f.read())
+    with open(text_bin, 'rb') as f:
+        custom_text = f.read()
+    r2 = subprocess.run(['/opt/rocm/llvm/bin/llvm-readelf', '-S', '--wide', ref_co_path],
+                        capture_output=True, text=True)
+    ref_text_off = -1
+    for line in r2.stdout.splitlines():
+        if '.text' in line and 'PROGBITS' in line:
+            parts = line.split()
+            for i, p in enumerate(parts):
+                if p == 'PROGBITS':
+                    ref_text_off = int(parts[i+2], 16)
+                    break
+            break
+    if ref_text_off < 0:
+        raise RuntimeError("Could not find .text section in ref .co")
+    ref_text_size = len(custom_text)
+    ref_data[ref_text_off:ref_text_off + ref_text_size] = custom_text
+    with open(co_path, 'wb') as f:
+        f.write(bytes(ref_data))
+    print(f"Assembled {s_path} -> {co_path}")
+    print(f"  Patched {ref_text_size} bytes into {ref_co_path} (metadata preserved)")
+    return co_path
+
+
+def bench_custom_co(custom_func, lhs, rhs, custom_out, lhs_scale, rhs_scale, group_offs,
+                    OUT_M, OUT_N, warmup=20, iters=50):
+    hip = _load_hip()
+    NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
+    args = [
+        _ptr(lhs), _ptr(rhs), _ptr(custom_out),
+        _ptr(lhs_scale), _ptr(rhs_scale), _ptr(group_offs),
+        _i32(E), _i32(OUT_M), _i32(OUT_N),
+        _i32(lhs.stride(0)), _i32(rhs.stride(0)),
+        _i32(custom_out.stride(0)), _i32(custom_out.stride(1)), _i32(custom_out.stride(2)),
+        ctypes.c_void_p(0), ctypes.c_void_p(0),
+    ]
+    packed, _s = _pack(*args)
+
+    def launch():
+        custom_out.zero_()
+        _check(hip.hipModuleLaunchKernel(
+            custom_func, NUM_SMS, 1, 1, 1024, 1, 1, 65536, None, packed, None))
+
+    for _ in range(warmup):
+        launch()
+    hip.hipDeviceSynchronize()
+
+    se = torch.cuda.Event(enable_timing=True)
+    ee = torch.cuda.Event(enable_timing=True)
+    se.record()
+    for _ in range(iters):
+        launch()
+    ee.record()
+    torch.cuda.synchronize()
+    return se.elapsed_time(ee) / iters
+
+
 def main():
     parser = argparse.ArgumentParser(description="dot_scaled grouped GEMM benchmark")
     parser.add_argument("--ref-co", type=str, default=None,
                         help="Reference .co for comparison (primus v26.2)")
+    parser.add_argument("--custom-co", type=str, default=None,
+                        help="Custom .co to benchmark (must have same kernel interface)")
+    parser.add_argument("--kernel", type=str, default=None,
+                        help="Custom .s file to assemble and benchmark")
     parser.add_argument("--site", type=str, default="all",
                         choices=list(SITES.keys()) + ["all"])
     parser.add_argument("--correctness", action="store_true")
@@ -233,6 +315,22 @@ def main():
         _check(hip.hipModuleGetFunction(
             ctypes.byref(ref_func), mod, b"_grouped_variable_k_gemm_kernel"))
         print(f"Loaded ref: {args.ref_co}")
+
+    # Load custom .co if provided (or assemble from .s)
+    custom_func = None
+    if args.kernel:
+        co_path = assemble_kernel(args.kernel, "kernels/dot_scaled_compiled.co")
+        args.custom_co = co_path
+    if args.custom_co:
+        hip = _load_hip()
+        with open(args.custom_co, 'rb') as f:
+            data = f.read()
+        mod = ctypes.c_void_p()
+        _check(hip.hipModuleLoadData(ctypes.byref(mod), data), f"loading {args.custom_co}")
+        custom_func = ctypes.c_void_p()
+        _check(hip.hipModuleGetFunction(
+            ctypes.byref(custom_func), mod, b"grouped_variable_k_dot_scaled_kernel"))
+        print(f"Loaded custom: {args.custom_co}")
 
     results = []
 
@@ -280,7 +378,42 @@ def main():
                                       group_offs, OUT_M, OUT_N, args.warmup, args.iters)
                 ref_tflops = flops / (ref_ms * 1e-3) / 1e12
 
+            custom_ms, custom_tflops = None, None
+            if custom_func is not None:
+                custom_out = torch.zeros(E, OUT_M, OUT_N, device="cuda", dtype=torch.bfloat16)
+                custom_ms = bench_custom_co(custom_func, lhs, rhs, custom_out, lhs_scale, rhs_scale,
+                                            group_offs, OUT_M, OUT_N, args.warmup, args.iters)
+                custom_tflops = flops / (custom_ms * 1e-3) / 1e12
+                if args.correctness:
+                    custom_out2 = torch.zeros(E, OUT_M, OUT_N, device="cuda", dtype=torch.bfloat16)
+                    custom_out2.zero_()
+                    hip = _load_hip()
+                    cargs = [
+                        _ptr(lhs), _ptr(rhs), _ptr(custom_out2),
+                        _ptr(lhs_scale), _ptr(rhs_scale), _ptr(group_offs),
+                        _i32(E), _i32(OUT_M), _i32(OUT_N),
+                        _i32(lhs.stride(0)), _i32(rhs.stride(0)),
+                        _i32(custom_out2.stride(0)), _i32(custom_out2.stride(1)), _i32(custom_out2.stride(2)),
+                        ctypes.c_void_p(0), ctypes.c_void_p(0),
+                    ]
+                    cpacked, _cs = _pack(*cargs)
+                    _check(hip.hipModuleLaunchKernel(
+                        custom_func, torch.cuda.get_device_properties(0).multi_processor_count,
+                        1, 1, 1024, 1, 1, 65536, None, cpacked, None))
+                    hip.hipDeviceSynchronize()
+                    ref_triton = run_dot_scaled(lhs, rhs, lhs_scale, rhs_scale, group_offs, OUT_M, OUT_N, E)
+                    torch.cuda.synchronize()
+                    af = custom_out2.float().flatten()
+                    bf = ref_triton.float().flatten()
+                    cos = (torch.dot(af, bf) / (af.norm() * bf.norm() + 1e-12)).item()
+                    max_diff = (custom_out2.float() - ref_triton.float()).abs().max().item()
+                    status = "PASS" if cos >= 0.999 else "FAIL"
+                    print(f"  Custom vs Triton: [{status}] cos={cos:.6f}  max_diff={max_diff:.6f}")
+
             print(f"\n  dot_scaled:    {ds_ms:8.3f} ms  {ds_tflops:7.1f} TFLOPS")
+            if custom_ms is not None:
+                speedup_custom = ds_ms / custom_ms
+                print(f"  custom ASM:    {custom_ms:8.3f} ms  {custom_tflops:7.1f} TFLOPS  ({speedup_custom:.3f}x vs Triton)")
             if ref_ms is not None:
                 speedup = ref_ms / ds_ms
                 print(f"  ref .co:       {ref_ms:8.3f} ms  {ref_tflops:7.1f} TFLOPS")
@@ -288,7 +421,8 @@ def main():
                 results.append({"site": site_name, "ds_ms": ds_ms, "ds_tflops": ds_tflops,
                                 "ref_ms": ref_ms, "ref_tflops": ref_tflops, "speedup": speedup})
             else:
-                results.append({"site": site_name, "ds_ms": ds_ms, "ds_tflops": ds_tflops})
+                results.append({"site": site_name, "ds_ms": ds_ms, "ds_tflops": ds_tflops,
+                                "custom_ms": custom_ms, "custom_tflops": custom_tflops})
 
     # ── Summary ──
     if len(results) > 1 and args.benchmark:
