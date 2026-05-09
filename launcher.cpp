@@ -111,14 +111,36 @@ int main(int argc, char** argv) {
     HIP_CHECK(hipMemcpy(d_lhs_scale, &scale_val, 4, hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_rhs_scale, &scale_val, 4, hipMemcpyHostToDevice));
 
-    // load kernel
+    // load kernel — try both kernel names
     auto co_data = read_file(co_path);
     hipModule_t module;
     hipFunction_t func;
     HIP_CHECK(hipModuleLoadData(&module, co_data.data()));
-    HIP_CHECK(hipModuleGetFunction(&func, module, "_grouped_variable_k_gemm_kernel"));
 
-    printf("Loaded: %s (%zu bytes)\n\n", co_path, co_data.size());
+    const char* kernel_names[] = {
+        "_grouped_variable_k_gemm_kernel",
+        "grouped_variable_k_dot_scaled_kernel",
+    };
+    const char* found_name = nullptr;
+    int shared_mem = 65536;
+    int block_size = 512;
+    for (auto name : kernel_names) {
+        if (hipModuleGetFunction(&func, module, name) == hipSuccess) {
+            found_name = name;
+            if (strstr(name, "dot_scaled")) {
+                shared_mem = 135104;
+                block_size = 1024;
+            }
+            break;
+        }
+    }
+    if (!found_name) {
+        fprintf(stderr, "No known kernel symbol found in %s\n", co_path);
+        return 1;
+    }
+
+    printf("Loaded: %s (%zu bytes, kernel=%s, shared=%d, block=%d)\n\n",
+           co_path, co_data.size(), found_name, shared_mem, block_size);
 
     // pack args
     KernelArgs args;
@@ -150,8 +172,8 @@ int main(int argc, char** argv) {
     for (int i = 0; i < warmup; i++) {
         HIP_CHECK(hipModuleLaunchKernel(func,
             num_cus, 1, 1,
-            512, 1, 1,
-            65536, nullptr, nullptr, config));
+            block_size, 1, 1,
+            shared_mem, nullptr, nullptr, config));
     }
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -164,8 +186,8 @@ int main(int argc, char** argv) {
     for (int i = 0; i < iters; i++) {
         HIP_CHECK(hipModuleLaunchKernel(func,
             num_cus, 1, 1,
-            512, 1, 1,
-            65536, nullptr, nullptr, config));
+            block_size, 1, 1,
+            shared_mem, nullptr, nullptr, config));
     }
     HIP_CHECK(hipEventRecord(stop, nullptr));
     HIP_CHECK(hipEventSynchronize(stop));
