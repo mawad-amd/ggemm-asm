@@ -4,7 +4,7 @@ Hand-tuned AMDGCN assembly optimization of Triton's FP8 grouped GEMM weight-grad
 
 Two optimization tracks:
 1. **Legacy MFMA** (`v_mfma_f32_16x16x32_fp8_bf8`): instruction scheduling on Triton's compiled output — **+10-16%**
-2. **dot_scaled MFMA** (`v_mfma_f32_32x32x64_f8f6f4`): MI355X-native opcode with 8x FLOPs/instruction, plus ASM scheduling — **1.52-1.64x**
+2. **dot_scaled MFMA** (`v_mfma_f32_32x32x64_f8f6f4`): MI355X-native opcode with 8x FLOPs/instruction, plus ASM scheduling — **1.39-1.40x**
 
 ## Kernels
 
@@ -27,8 +27,8 @@ MI355X (gfx950), ROCm 7.2.0. C launcher (co_compare.cpp), warmup=50, iters=200. 
 |--------|-----------|--------|---------------|
 | Legacy ref (Triton) | 3.587 | 1213 | 1.00x |
 | Legacy ASM (mega) | 3.091 | 1407 | **1.16x** |
-| dot_scaled Triton JIT | 2.578 | 1687 | 1.51x |
-| **dot_scaled ASM v2** | **2.558** | **1700** | **1.52x** |
+| dot_scaled Triton JIT | 2.578 | 1687 | 1.39x |
+| **dot_scaled ASM v2** | **2.558** | **1700** | **1.40x** |
 
 ### down_wgrad (E=32, M=131072, OUT_M=2880, OUT_N=2880, 2.17 TFLOP)
 
@@ -36,8 +36,8 @@ MI355X (gfx950), ROCm 7.2.0. C launcher (co_compare.cpp), warmup=50, iters=200. 
 |--------|-----------|--------|---------------|
 | Legacy ref (Triton) | 1.864 | 1167 | 1.00x |
 | Legacy ASM (mega) | 1.607 | 1353 | **1.16x** |
-| dot_scaled Triton JIT | 1.341 | 1621 | 1.64x |
-| **dot_scaled ASM v2** | **1.338** | **1625** | **1.64x** |
+| dot_scaled Triton JIT | 1.341 | 1621 | 1.39x |
+| **dot_scaled ASM v2** | **1.338** | **1625** | **1.39x** |
 
 Correctness: cos=1.000, max_diff=0.031250 vs torch on both sites. dot_scaled ASM vs dot_scaled Triton: cos=1.000, max_diff=0.000 (bit-identical).
 
