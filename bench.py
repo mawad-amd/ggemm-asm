@@ -241,7 +241,7 @@ def assemble_kernel(s_path, ref_co_path):
 
 
 def bench_custom_co(custom_func, lhs, rhs, custom_out, lhs_scale, rhs_scale, group_offs,
-                    OUT_M, OUT_N, warmup=20, iters=50):
+                    OUT_M, OUT_N, warmup=20, iters=50, block_size=1024):
     hip = _load_hip()
     NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
     args = [
@@ -257,7 +257,7 @@ def bench_custom_co(custom_func, lhs, rhs, custom_out, lhs_scale, rhs_scale, gro
     def launch():
         custom_out.zero_()
         _check(hip.hipModuleLaunchKernel(
-            custom_func, NUM_SMS, 1, 1, 1024, 1, 1, 65536, None, packed, None))
+            custom_func, NUM_SMS, 1, 1, block_size, 1, 1, 65536, None, packed, None))
 
     for _ in range(warmup):
         launch()
@@ -318,8 +318,10 @@ def main():
 
     # Load custom .co if provided (or assemble from .s)
     custom_func = None
+    custom_block_size = 1024
     if args.kernel:
-        co_path = assemble_kernel(args.kernel, "kernels/dot_scaled_compiled.co")
+        patch_base = args.ref_co if args.ref_co else "kernels/dot_scaled_compiled.co"
+        co_path = assemble_kernel(args.kernel, patch_base)
         args.custom_co = co_path
     if args.custom_co:
         hip = _load_hip()
@@ -328,9 +330,20 @@ def main():
         mod = ctypes.c_void_p()
         _check(hip.hipModuleLoadData(ctypes.byref(mod), data), f"loading {args.custom_co}")
         custom_func = ctypes.c_void_p()
-        _check(hip.hipModuleGetFunction(
-            ctypes.byref(custom_func), mod, b"grouped_variable_k_dot_scaled_kernel"))
-        print(f"Loaded custom: {args.custom_co}")
+        import subprocess as _sp
+        _elf = _sp.run(["/opt/rocm/llvm/bin/llvm-readelf", "-s", "--wide", args.custom_co],
+                       capture_output=True, text=True)
+        _sym = None
+        for _line in _elf.stdout.splitlines():
+            if "FUNC" in _line and "GLOBAL" in _line:
+                _sym = _line.split()[-1].encode()
+                break
+        if _sym is None:
+            _sym = b"grouped_variable_k_dot_scaled_kernel"
+        _check(hip.hipModuleGetFunction(ctypes.byref(custom_func), mod, _sym))
+        if b"dot_scaled" not in _sym:
+            custom_block_size = 512
+        print(f"Loaded custom: {args.custom_co} (kernel={_sym.decode()})")
 
     results = []
 
@@ -382,7 +395,8 @@ def main():
             if custom_func is not None:
                 custom_out = torch.zeros(E, OUT_M, OUT_N, device="cuda", dtype=torch.bfloat16)
                 custom_ms = bench_custom_co(custom_func, lhs, rhs, custom_out, lhs_scale, rhs_scale,
-                                            group_offs, OUT_M, OUT_N, args.warmup, args.iters)
+                                            group_offs, OUT_M, OUT_N, args.warmup, args.iters,
+                                            block_size=custom_block_size)
                 custom_tflops = flops / (custom_ms * 1e-3) / 1e12
                 if args.correctness:
                     custom_out2 = torch.zeros(E, OUT_M, OUT_N, device="cuda", dtype=torch.bfloat16)
@@ -399,16 +413,34 @@ def main():
                     cpacked, _cs = _pack(*cargs)
                     _check(hip.hipModuleLaunchKernel(
                         custom_func, torch.cuda.get_device_properties(0).multi_processor_count,
-                        1, 1, 1024, 1, 1, 65536, None, cpacked, None))
+                        1, 1, custom_block_size, 1, 1, 65536, None, cpacked, None))
                     hip.hipDeviceSynchronize()
-                    ref_triton = run_dot_scaled(lhs, rhs, lhs_scale, rhs_scale, group_offs, OUT_M, OUT_N, E)
-                    torch.cuda.synchronize()
+                    if ref_func is not None and custom_block_size == 512:
+                        compare_out = torch.zeros(E, OUT_M, OUT_N, device="cuda", dtype=torch.bfloat16)
+                        ref_args = [
+                            _ptr(lhs), _ptr(rhs), _ptr(compare_out),
+                            _ptr(lhs_scale), _ptr(rhs_scale), _ptr(group_offs),
+                            _i32(E), _i32(OUT_M), _i32(OUT_N),
+                            _i32(lhs.stride(0)), _i32(rhs.stride(0)),
+                            _i32(compare_out.stride(0)), _i32(compare_out.stride(1)), _i32(compare_out.stride(2)),
+                            ctypes.c_void_p(0), ctypes.c_void_p(0),
+                        ]
+                        rpacked, _rs = _pack(*ref_args)
+                        _check(hip.hipModuleLaunchKernel(
+                            ref_func, torch.cuda.get_device_properties(0).multi_processor_count,
+                            1, 1, 512, 1, 1, 65536, None, rpacked, None))
+                        hip.hipDeviceSynchronize()
+                        compare_label = "Custom vs ref .co"
+                    else:
+                        compare_out = run_dot_scaled(lhs, rhs, lhs_scale, rhs_scale, group_offs, OUT_M, OUT_N, E)
+                        torch.cuda.synchronize()
+                        compare_label = "Custom vs Triton"
                     af = custom_out2.float().flatten()
-                    bf = ref_triton.float().flatten()
+                    bf = compare_out.float().flatten()
                     cos = (torch.dot(af, bf) / (af.norm() * bf.norm() + 1e-12)).item()
-                    max_diff = (custom_out2.float() - ref_triton.float()).abs().max().item()
+                    max_diff = (custom_out2.float() - compare_out.float()).abs().max().item()
                     status = "PASS" if cos >= 0.999 else "FAIL"
-                    print(f"  Custom vs Triton: [{status}] cos={cos:.6f}  max_diff={max_diff:.6f}")
+                    print(f"  {compare_label}: [{status}] cos={cos:.6f}  max_diff={max_diff:.6f}")
 
             print(f"\n  dot_scaled:    {ds_ms:8.3f} ms  {ds_tflops:7.1f} TFLOPS")
             if custom_ms is not None:
